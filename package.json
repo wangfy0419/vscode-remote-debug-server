@@ -1,0 +1,189 @@
+{
+	"name": "remote-debug-server",
+	"publisher": "xhosa",
+	"displayName": "Remote Debug (Server)",
+	"description": "Provide remote-side ADB, Fastboot, serial, and container shell bridge services for Remote Debug",
+	"repository": "https://code.xgimi.com/ai-productivity/vscode-remote-adb-server",
+	"version": "1.0.14",
+	"engines": {
+		"vscode": "^1.74.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"keywords": [
+		"remote",
+		"remote development",
+		"adb",
+		"android",
+		"debugging"
+	],
+	"activationEvents": [
+		"onStartupFinished",
+		"onCommand:remote-debug-server.activate",
+		"onCommand:remote-debug-server.openExternal",
+		"onCommand:remote-debug-server.getExternalUrl",
+		"onCommand:remote-debug-server.getFastbootExternalUrl",
+		"onCommand:remote-debug-server.getSerialExternalUrl",
+		"onCommand:remote-debug-server.getAdbBridgeExternalUrl",
+		"onCommand:remote-debug-server.listAdbBridgeDevices",
+		"onCommand:remote-debug-server.getDeviceIp",
+		"onCommand:remote-debug-server.openAdbDevicesTerminal",
+		"onCommand:remote-debug-server.openSerialTerminal",
+		"onCommand:remote-debug-server.openSerialLogTerminal",
+		"onCommand:remote-debug-server.openDeviceShell",
+		"onCommand:remote-debug-server.startLogcat",
+		"onCommand:remote-debug-server.captureScreenshot",
+		"onCommand:remote-debug-server.addSerialToCopilotMcp",
+		"onCommand:remote-debug-server.addSerialToClaudeMcp",
+		"onCommand:remote-debug-server.getContainerShellExternalUrl",
+		"onCommand:remote-debug-server.stopContainerShellServer",
+		"onCommand:remote-debug-server.stopAdbBridgeServer"
+	],
+	"main": "./dist/extension.js",
+	"extensionKind": [
+		"workspace"
+	],
+	"contributes": {
+		"configuration": {
+			"title": "Remote Debug Server",
+			"properties": {
+				"remote-debug-server.fastbootPath": {
+					"type": "string",
+					"default": "fastboot",
+					"description": "Path to the fastboot executable on the remote host, used to register bridged TCP devices."
+				},
+				"remote-debug-server.fastbootAutoRegister": {
+					"type": "boolean",
+					"default": true,
+					"description": "Automatically run fastboot connect/disconnect for bridged TCP fastboot devices."
+				},
+				"remote-debug-server.containerShellPath": {
+					"type": "string",
+					"default": "/bin/bash",
+					"description": "Absolute path of the shell used to execute Container Shell commands."
+				},
+				"remote-debug-server.containerShellCwd": {
+					"type": "string",
+					"default": "",
+					"description": "Absolute working directory for Container Shell commands. Empty uses the first workspace folder."
+				}
+			}
+		},
+		"commands": [
+			{
+				"command": "remote-debug-server.activate",
+				"title": "Activate Remote Debug Server",
+				"category": "Remote Debug"
+			},
+			{
+				"command": "remote-debug-server.openExternal",
+				"title": "Open in browser to connect Android devices",
+				"category": "Remote Debug"
+			},
+			{
+				"command": "remote-debug-server.stopServer",
+				"title": "Stop server",
+				"category": "Remote Debug"
+			},
+			{
+				"command": "remote-debug-server.stopFastbootServer",
+				"title": "Stop Fastboot bridge",
+				"category": "Remote Debug"
+			},
+			{
+				"command": "remote-debug-server.openSerialTerminal",
+				"title": "Open Serial Terminal",
+				"category": "Remote Debug"
+			},
+			{
+				"command": "remote-debug-server.openSerialLogTerminal",
+				"title": "Open Timestamped Serial Log",
+				"category": "Remote Debug"
+			},
+			{
+				"command": "remote-debug-server.openDeviceShell",
+				"title": "Open Device Shell",
+				"category": "Remote Debug"
+			},
+			{
+				"command": "remote-debug-server.openAdbDevicesTerminal",
+				"title": "Show ADB Devices",
+				"category": "Remote Debug"
+			},
+			{
+				"command": "remote-debug-server.startLogcat",
+				"title": "Start Logcat",
+				"category": "Remote Debug"
+			},
+			{
+				"command": "remote-debug-server.captureScreenshot",
+				"title": "Capture Screenshot",
+				"category": "Remote Debug"
+			},
+			{
+				"command": "remote-debug-server.addSerialToCopilotMcp",
+				"title": "Add Remote Serial to GitHub Copilot MCP",
+				"category": "Remote Debug"
+			},
+			{
+				"command": "remote-debug-server.addSerialToClaudeMcp",
+				"title": "Add Remote Serial to Claude Code MCP",
+				"category": "Remote Debug"
+			},
+			{
+				"command": "remote-debug-server.stopSerialServer",
+				"title": "Stop Serial bridge",
+				"category": "Remote Debug"
+			},
+			{
+				"command": "remote-debug-server.stopAdbBridgeServer",
+				"title": "Stop Local ADB bridge",
+				"category": "Remote Debug"
+			},
+			{
+				"command": "remote-debug-server.stopContainerShellServer",
+				"title": "Stop Container Shell server",
+				"category": "Container Shell"
+			}
+		]
+	},
+	"scripts": {
+		"vscode:prepublish": "npm run package",
+		"compile": "npm run check-types && node esbuild.js",
+		"check-types": "tsc --noEmit",
+		"watch": "npm-run-all -p watch:*",
+		"watch:esbuild": "node esbuild.js --watch",
+		"watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+		"package": "npm run check-types && node esbuild.js --production",
+		"compile-tests": "tsc -p . --outDir out",
+		"watch-tests": "tsc -p . -w --outDir out",
+		"pretest": "npm run compile-tests && npm run compile && npm run lint",
+		"lint": "eslint src --ext ts",
+		"test": "node ./out/test/runTest.js",
+		"install-remote-adb-web": "shx mkdir -p dist/ && shx cp -r node_modules/remote-adb/dist/web dist/",
+		"postinstall": "npm run install-remote-adb-web"
+	},
+	"devDependencies": {
+		"@types/glob": "^7.2.0",
+		"@types/mocha": "^9.1.1",
+		"@types/node": "16.x",
+		"@types/vscode": "^1.74.0",
+		"@types/ws": "^7.4.7",
+		"@typescript-eslint/eslint-plugin": "^5.30.0",
+		"@typescript-eslint/parser": "^5.30.0",
+		"@vscode/test-electron": "^2.1.5",
+		"esbuild": "^0.23.1",
+		"eslint": "^8.18.0",
+		"glob": "^8.0.3",
+		"mocha": "^10.0.0",
+		"npm-run-all": "^4.1.5",
+		"shx": "^0.3.4",
+		"typescript": "^5.5.4"
+	},
+	"dependencies": {
+		"jsonc-parser": "^3.3.1",
+		"remote-adb": "^3.2.0",
+		"ws": "^7.5.9"
+	}
+}

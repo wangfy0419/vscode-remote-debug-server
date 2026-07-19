@@ -1,0 +1,848 @@
+#!/usr/bin/env python3
+"""Unified interactive terminal and MCP server for Remote Debug Serial."""
+
+
+# claude mcp add --transport stdio --scope project remote-serial --   python3 "${PWD}/.vscode/mcp/remote-serial" --mcp
+from __future__ import print_function
+
+import argparse
+import binascii
+import datetime
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import queue
+import re
+import selectors
+import signal
+import socket
+import stat
+import sys
+import termios
+import threading
+import time
+import tty
+
+
+SERVER_NAME = "remote-serial"
+SERVER_VERSION = "2.1.0"
+PROTOCOL_VERSION = "2024-11-05"
+DEFAULT_ENDPOINT = "127.0.0.1:39001"
+EXIT_BYTE = b"\x1d"  # Ctrl+]
+BUFFER_SIZE = 65536
+BUFFER_LIMIT = 4 * 1024 * 1024
+RESULT_LIMIT = 64 * 1024
+CLIENT_QUEUE_LIMIT = 1024 * 1024
+PIPE_IDLE_TIMEOUT = 0.2
+
+
+def parse_target(endpoint, explicit_port=None):
+    if explicit_port is not None:
+        host = endpoint
+        port_text = explicit_port
+    else:
+        if not endpoint or endpoint.count(":") != 1:
+            raise ValueError("use HOST:PORT, for example 127.0.0.1:39001")
+        host, port_text = endpoint.rsplit(":", 1)
+    if not host:
+        raise ValueError("host must not be empty")
+    try:
+        port = int(port_text)
+    except ValueError:
+        raise ValueError("port must be an integer")
+    if port < 1 or port > 65535:
+        raise ValueError("port must be between 1 and 65535")
+    return host, port
+
+
+def parse_endpoint(endpoint):
+    return parse_target(endpoint)
+
+
+def canonical_endpoint(endpoint):
+    host, port = parse_endpoint(endpoint)
+    return "{0}:{1}".format(host, port)
+
+
+def line_ending_bytes(name):
+    endings = {"none": b"", "lf": b"\n", "cr": b"\r", "crlf": b"\r\n"}
+    if name not in endings:
+        raise ValueError("line_ending must be one of: none, lf, cr, crlf")
+    return endings[name]
+
+
+def payload_result(data, truncated=False):
+    total_bytes = len(data)
+    if total_bytes > RESULT_LIMIT:
+        data = data[-RESULT_LIMIT:]
+        truncated = True
+    return {
+        "bytes": len(data),
+        "total_bytes": total_bytes,
+        "text": data.decode("utf-8", "replace"),
+        "hex": binascii.hexlify(data).decode("ascii"),
+        "truncated": bool(truncated),
+    }
+
+
+def broker_paths(endpoint):
+    digest = hashlib.sha256(canonical_endpoint(endpoint).encode("utf-8")).hexdigest()[:24]
+    directory = os.path.join("/tmp", "remote-serial-{0}".format(os.getuid()))
+    return directory, os.path.join(directory, digest + ".sock"), os.path.join(directory, digest + ".lock")
+
+
+def ensure_broker_directory(directory):
+    try:
+        os.makedirs(directory, 0o700)
+    except OSError as error:
+        if error.errno != errno.EEXIST:
+            raise
+    info = os.stat(directory)
+    if info.st_uid != os.getuid() or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError("unsafe remote-serial broker directory: {0}".format(directory))
+    os.chmod(directory, 0o700)
+
+
+def connect_unix(path, timeout):
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(float(timeout))
+    try:
+        connection.connect(path)
+    except Exception:
+        connection.close()
+        raise
+    connection.settimeout(None)
+    return connection
+
+
+class BrokerPeer(object):
+    def __init__(self, broker, connection):
+        self.broker = broker
+        self.connection = connection
+        self.outbox = queue.Queue()
+        self.pending_bytes = 0
+        self.pending_lock = threading.Lock()
+        self.closed = threading.Event()
+
+    def start(self):
+        reader = threading.Thread(target=self._read_loop)
+        writer = threading.Thread(target=self._write_loop)
+        reader.daemon = True
+        writer.daemon = True
+        reader.start()
+        writer.start()
+
+    def enqueue(self, data):
+        with self.pending_lock:
+            if self.closed.is_set():
+                return False
+            if self.pending_bytes + len(data) > CLIENT_QUEUE_LIMIT:
+                self.close()
+                return False
+            self.pending_bytes += len(data)
+        self.outbox.put(data)
+        return True
+
+    def _read_loop(self):
+        try:
+            while not self.closed.is_set():
+                data = self.connection.recv(BUFFER_SIZE)
+                if not data:
+                    break
+                self.broker.send_upstream(data)
+        except OSError:
+            pass
+        finally:
+            self.close()
+
+    def _write_loop(self):
+        try:
+            while not self.closed.is_set():
+                data = self.outbox.get()
+                if data is None:
+                    break
+                self.connection.sendall(data)
+                with self.pending_lock:
+                    self.pending_bytes -= len(data)
+        except OSError:
+            pass
+        finally:
+            self.close()
+
+    def close(self):
+        if self.closed.is_set():
+            return
+        self.closed.set()
+        self.broker.remove_peer(self)
+        self.outbox.put(None)
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.connection.close()
+        except OSError:
+            pass
+
+
+class SerialBroker(object):
+    def __init__(self, endpoint, listener, upstream, socket_path, lock_file):
+        self.endpoint = endpoint
+        self.listener = listener
+        self.upstream = upstream
+        self.socket_path = socket_path
+        self.lock_file = lock_file
+        self.stop_event = threading.Event()
+        self.send_lock = threading.Lock()
+        self.peers_lock = threading.Lock()
+        self.peers = set()
+
+    def start(self):
+        accept_thread = threading.Thread(target=self._accept_loop)
+        upstream_thread = threading.Thread(target=self._upstream_loop)
+        accept_thread.daemon = True
+        upstream_thread.daemon = True
+        accept_thread.start()
+        upstream_thread.start()
+
+    def _accept_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                connection, _address = self.listener.accept()
+            except OSError:
+                break
+            peer = BrokerPeer(self, connection)
+            with self.peers_lock:
+                if self.stop_event.is_set():
+                    connection.close()
+                    break
+                self.peers.add(peer)
+            peer.start()
+
+    def _upstream_loop(self):
+        try:
+            while not self.stop_event.is_set():
+                data = self.upstream.recv(BUFFER_SIZE)
+                if not data:
+                    break
+                with self.peers_lock:
+                    peers = list(self.peers)
+                for peer in peers:
+                    peer.enqueue(data)
+        except OSError:
+            pass
+        finally:
+            self.stop()
+
+    def send_upstream(self, data):
+        try:
+            with self.send_lock:
+                if self.stop_event.is_set():
+                    raise RuntimeError("serial broker is closed")
+                self.upstream.sendall(data)
+        except (OSError, RuntimeError):
+            self.stop()
+            raise
+
+    def remove_peer(self, peer):
+        with self.peers_lock:
+            self.peers.discard(peer)
+
+    def stop(self):
+        if self.stop_event.is_set():
+            return
+        self.stop_event.set()
+        try:
+            self.listener.close()
+        except OSError:
+            pass
+        try:
+            self.upstream.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.upstream.close()
+        except OSError:
+            pass
+        with self.peers_lock:
+            peers = list(self.peers)
+        for peer in peers:
+            peer.close()
+        try:
+            if os.path.exists(self.socket_path):
+                os.unlink(self.socket_path)
+        except OSError:
+            pass
+        if self.lock_file is not None:
+            try:
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                self.lock_file.close()
+                self.lock_file = None
+
+
+def open_shared_connection(endpoint, timeout=10.0):
+    endpoint = canonical_endpoint(endpoint)
+    host, port = parse_endpoint(endpoint)
+    directory, socket_path, lock_path = broker_paths(endpoint)
+    ensure_broker_directory(directory)
+    try:
+        return connect_unix(socket_path, timeout), None, "client"
+    except OSError:
+        pass
+
+    lock_file = open(lock_path, "a+")
+    broker = None
+    lock_owned = False
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_owned = True
+        except (IOError, OSError) as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            deadline = time.monotonic() + float(timeout)
+            while time.monotonic() < deadline:
+                try:
+                    connection = connect_unix(socket_path, min(0.2, max(0.01, deadline - time.monotonic())))
+                    return connection, None, "client"
+                except OSError:
+                    time.sleep(0.02)
+            raise RuntimeError("remote-serial broker is active but its local socket is unavailable")
+
+        if os.path.lexists(socket_path):
+            info = os.lstat(socket_path)
+            if info.st_uid != os.getuid() or not stat.S_ISSOCK(info.st_mode):
+                raise RuntimeError("unsafe remote-serial broker socket: {0}".format(socket_path))
+            os.unlink(socket_path)
+
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(socket_path)
+            os.chmod(socket_path, 0o600)
+            listener.listen(8)
+            upstream = socket.create_connection((host, port), float(timeout))
+            upstream.settimeout(None)
+        except Exception:
+            listener.close()
+            try:
+                os.unlink(socket_path)
+            except OSError:
+                pass
+            raise
+        broker = SerialBroker(endpoint, listener, upstream, socket_path, lock_file)
+        lock_file = None
+        lock_owned = False
+        broker.start()
+        try:
+            connection = connect_unix(socket_path, timeout)
+        except Exception:
+            broker.stop()
+            raise
+        return connection, broker, "owner"
+    finally:
+        if lock_file is not None:
+            try:
+                if lock_owned:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_file.close()
+
+
+class TerminalMode(object):
+    def __init__(self, fd):
+        self.fd = fd
+        self.original = None
+
+    def __enter__(self):
+        if os.isatty(self.fd):
+            self.original = termios.tcgetattr(self.fd)
+            tty.setraw(self.fd)
+        return self
+
+    def __exit__(self, _type, _value, _traceback):
+        if self.original is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.original)
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        try:
+            written = os.write(fd, view)
+        except OSError as error:
+            if error.errno == errno.EINTR:
+                continue
+            raise
+        view = view[written:]
+
+
+def timestamp_prefix():
+    return datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S.%f")[:-3] + "] "
+
+
+def write_timestamped(output_fd, data, state):
+    if not data:
+        return
+    text = data.decode("utf-8", "replace")
+    for character in text:
+        if state["line_start"]:
+            write_all(output_fd, timestamp_prefix().encode("utf-8"))
+            state["line_start"] = False
+        write_all(output_fd, character.encode("utf-8", "replace"))
+        if character == "\n":
+            state["line_start"] = True
+
+
+def run_terminal(connection, input_fd, output_fd, escape_enabled, timestamps=False):
+    selector = selectors.DefaultSelector()
+    selector.register(connection, selectors.EVENT_READ, "socket")
+    selector.register(input_fd, selectors.EVENT_READ, "stdin")
+    stdin_open = True
+    idle_deadline = None
+    timestamp_state = {"line_start": True}
+    try:
+        while True:
+            timeout = None if idle_deadline is None else max(0.0, idle_deadline - time.monotonic())
+            events = selector.select(timeout)
+            if not events and idle_deadline is not None and time.monotonic() >= idle_deadline:
+                return 0
+            for key, _events in events:
+                if key.data == "socket":
+                    data = connection.recv(BUFFER_SIZE)
+                    if not data:
+                        return 0
+                    if timestamps:
+                        write_timestamped(output_fd, data, timestamp_state)
+                    else:
+                        write_all(output_fd, data)
+                    if idle_deadline is not None:
+                        idle_deadline = time.monotonic() + PIPE_IDLE_TIMEOUT
+                    continue
+                data = os.read(input_fd, BUFFER_SIZE)
+                if not data:
+                    selector.unregister(input_fd)
+                    stdin_open = False
+                    idle_deadline = time.monotonic() + PIPE_IDLE_TIMEOUT
+                    continue
+                if escape_enabled:
+                    exit_at = data.find(EXIT_BYTE)
+                    if exit_at >= 0:
+                        if exit_at:
+                            connection.sendall(data[:exit_at])
+                        return 0
+                connection.sendall(data)
+            if not stdin_open and idle_deadline is None:
+                idle_deadline = time.monotonic() + PIPE_IDLE_TIMEOUT
+    finally:
+        selector.close()
+
+
+class SerialTcpSession(object):
+    def __init__(self):
+        self.endpoint = None
+        self.sock = None
+        self.broker = None
+        self.broker_role = None
+        self.reader = None
+        self.stop_event = threading.Event()
+        self.condition = threading.Condition()
+        self.send_lock = threading.Lock()
+        self.history = bytearray()
+        self.base_offset = 0
+        self.read_offset = 0
+        self.last_error = None
+
+    def open(self, endpoint, timeout=10.0):
+        if not endpoint:
+            raise ValueError("endpoint is required; ask the user for the HOST:PORT shown in the Remote Debug view")
+        self.close()
+        connection, broker, role = open_shared_connection(endpoint, timeout)
+        with self.condition:
+            self.endpoint = canonical_endpoint(endpoint)
+            self.sock = connection
+            self.broker = broker
+            self.broker_role = role
+            self.stop_event.clear()
+            self.history = bytearray()
+            self.base_offset = 0
+            self.read_offset = 0
+            self.last_error = None
+            self.condition.notify_all()
+        self.reader = threading.Thread(target=self._reader_loop, args=(connection,))
+        self.reader.daemon = True
+        self.reader.start()
+        return self.status()
+
+    def close(self):
+        with self.condition:
+            connection = self.sock
+            broker = self.broker
+            self.stop_event.set()
+            self.sock = None
+            self.broker = None
+            self.condition.notify_all()
+        if connection is not None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                connection.close()
+            except OSError:
+                pass
+        if broker is not None:
+            broker.stop()
+        reader = self.reader
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(1.0)
+        self.reader = None
+
+    def _reader_loop(self, connection):
+        error_text = None
+        try:
+            while not self.stop_event.is_set():
+                data = connection.recv(BUFFER_SIZE)
+                if not data:
+                    error_text = "remote serial broker closed the connection"
+                    break
+                with self.condition:
+                    self.history.extend(data)
+                    overflow = len(self.history) - BUFFER_LIMIT
+                    if overflow > 0:
+                        del self.history[:overflow]
+                        self.base_offset += overflow
+                        if self.read_offset < self.base_offset:
+                            self.read_offset = self.base_offset
+                    self.condition.notify_all()
+        except OSError as error:
+            if not self.stop_event.is_set():
+                error_text = str(error)
+        finally:
+            with self.condition:
+                if self.sock is connection:
+                    self.sock = None
+                    self.last_error = error_text
+                self.condition.notify_all()
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+    def connected(self):
+        with self.condition:
+            return self.sock is not None
+
+    def status(self):
+        with self.condition:
+            return {
+                "connected": self.sock is not None,
+                "endpoint": self.endpoint,
+                "broker_role": self.broker_role,
+                "buffered_bytes": self.base_offset + len(self.history) - self.read_offset,
+                "history_bytes": len(self.history),
+                "last_error": self.last_error,
+            }
+
+    def mark(self):
+        with self.condition:
+            return self.base_offset + len(self.history)
+
+    def clear(self):
+        with self.condition:
+            self.read_offset = self.base_offset + len(self.history)
+            return self.status()
+
+    def write(self, data):
+        with self.send_lock:
+            with self.condition:
+                connection = self.sock
+                error_text = self.last_error
+            if connection is None:
+                raise RuntimeError(error_text or "serial endpoint is not connected")
+            connection.sendall(data)
+        return len(data)
+
+    def read(self, timeout=0.2, max_bytes=65536, consume=True):
+        timeout = max(0.0, float(timeout))
+        max_bytes = int(max_bytes)
+        if max_bytes < 1 or max_bytes > BUFFER_LIMIT:
+            raise ValueError("max_bytes must be between 1 and {0}".format(BUFFER_LIMIT))
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while True:
+                if self.read_offset < self.base_offset:
+                    self.read_offset = self.base_offset
+                start = self.read_offset - self.base_offset
+                if start < len(self.history):
+                    data = bytes(self.history[start:start + max_bytes])
+                    if consume:
+                        self.read_offset += len(data)
+                    return data
+                if self.sock is None:
+                    if self.last_error:
+                        raise RuntimeError(self.last_error)
+                    return b""
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return b""
+                self.condition.wait(remaining)
+
+    def wait_for(self, pattern, timeout=30.0, start_offset=None, consume=True):
+        try:
+            expression = re.compile(pattern.encode("utf-8"))
+        except re.error as error:
+            raise ValueError("invalid pattern: {0}".format(error))
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self.condition:
+            search_offset = self.read_offset if start_offset is None else int(start_offset)
+            truncated = False
+            while True:
+                if search_offset < self.base_offset:
+                    search_offset = self.base_offset
+                    truncated = True
+                start = search_offset - self.base_offset
+                snapshot = bytes(self.history[start:])
+                match = expression.search(snapshot)
+                if match is not None:
+                    absolute_end = search_offset + match.end()
+                    if consume:
+                        self.read_offset = max(self.read_offset, absolute_end)
+                    return snapshot[:match.end()], truncated
+                if self.sock is None:
+                    raise RuntimeError(self.last_error or "serial endpoint disconnected while waiting")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("timed out waiting for pattern: {0}".format(pattern))
+                self.condition.wait(remaining)
+
+
+TOOLS = [
+    {
+        "name": "serial_open",
+        "description": "Open the Serial endpoint, defaulting to 127.0.0.1:39001. Override endpoint only when Remote Debug reports a fallback port.",
+        "inputSchema": {"type": "object", "properties": {"endpoint": {"type": "string", "default": DEFAULT_ENDPOINT}, "timeout": {"type": "number", "minimum": 0.1, "default": 10}}, "additionalProperties": False},
+    },
+    {"name": "serial_close", "description": "Close this serial connection.", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "serial_status", "description": "Return serial and broker connection state.", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "serial_clear", "description": "Discard unread buffered serial data.", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {
+        "name": "serial_read",
+        "description": "Read buffered serial data, optionally waiting for bytes.",
+        "inputSchema": {"type": "object", "properties": {"timeout": {"type": "number", "minimum": 0, "default": 0.2}, "max_bytes": {"type": "integer", "minimum": 1, "maximum": BUFFER_LIMIT, "default": 65536}, "consume": {"type": "boolean", "default": True}}, "additionalProperties": False},
+    },
+    {
+        "name": "serial_write",
+        "description": "Write UTF-8 text with an optional line ending.",
+        "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}, "line_ending": {"type": "string", "enum": ["none", "lf", "cr", "crlf"], "default": "none"}}, "required": ["text"], "additionalProperties": False},
+    },
+    {
+        "name": "serial_write_hex",
+        "description": "Write raw hexadecimal bytes.",
+        "inputSchema": {"type": "object", "properties": {"hex": {"type": "string"}}, "required": ["hex"], "additionalProperties": False},
+    },
+    {
+        "name": "serial_wait_for",
+        "description": "Wait for a byte-oriented regular expression.",
+        "inputSchema": {"type": "object", "properties": {"pattern": {"type": "string"}, "timeout": {"type": "number", "minimum": 0, "default": 30}, "consume": {"type": "boolean", "default": True}}, "required": ["pattern"], "additionalProperties": False},
+    },
+    {
+        "name": "serial_command",
+        "description": "Send one command and wait for a prompt pattern, returning the complete response.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "line_ending": {"type": "string", "enum": ["lf", "cr", "crlf"], "default": "cr"},
+                "prompt_pattern": {"type": "string", "default": "(?m).*[#$>]\\s*$"},
+                "timeout": {"type": "number", "minimum": 0, "default": 30},
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "serial_enter_uboot",
+        "description": "Send reboot, immediately flood Enter, and wait for a U-Boot/mboot prompt.",
+        "inputSchema": {"type": "object", "properties": {"reboot_command": {"type": "string", "default": "reboot"}, "enter_window": {"type": "number", "minimum": 0.1, "default": 60}, "enter_interval": {"type": "number", "minimum": 0.01, "default": 0.1}, "prompt_pattern": {"type": "string", "default": "(?m).*(#|=>)\\s*$"}, "prompt_timeout": {"type": "number", "minimum": 0, "default": 30}}, "additionalProperties": False},
+    },
+]
+
+
+class RemoteSerialMcpServer(object):
+    def __init__(self, default_endpoint=None):
+        self.session = SerialTcpSession()
+        self.default_endpoint = canonical_endpoint(default_endpoint or os.environ.get("REMOTE_SERIAL_ENDPOINT") or DEFAULT_ENDPOINT)
+
+    def call_tool(self, name, arguments):
+        arguments = arguments or {}
+        if name == "serial_open":
+            return self.session.open(arguments.get("endpoint") or self.default_endpoint, arguments.get("timeout", 10))
+        if name == "serial_close":
+            self.session.close()
+            return self.session.status()
+        if name == "serial_status":
+            return self.session.status()
+        if name == "serial_clear":
+            return self.session.clear()
+        if name == "serial_read":
+            data = self.session.read(arguments.get("timeout", 0.2), arguments.get("max_bytes", 65536), arguments.get("consume", True))
+            result = payload_result(data)
+            result["connected"] = self.session.connected()
+            return result
+        if name == "serial_write":
+            data = arguments["text"].encode("utf-8") + line_ending_bytes(arguments.get("line_ending", "none"))
+            return {"bytes_written": self.session.write(data)}
+        if name == "serial_write_hex":
+            cleaned = re.sub(r"[\s,:_-]+", "", arguments["hex"])
+            try:
+                data = binascii.unhexlify(cleaned)
+            except (TypeError, binascii.Error):
+                raise ValueError("hex must contain complete hexadecimal byte pairs")
+            return {"bytes_written": self.session.write(data)}
+        if name == "serial_wait_for":
+            data, truncated = self.session.wait_for(arguments["pattern"], arguments.get("timeout", 30), consume=arguments.get("consume", True))
+            return payload_result(data, truncated)
+        if name == "serial_command":
+            start = self.session.mark()
+            data = arguments["command"].encode("utf-8") + line_ending_bytes(arguments.get("line_ending", "cr"))
+            written = self.session.write(data)
+            response, truncated = self.session.wait_for(arguments.get("prompt_pattern", r"(?m).*[#$>]\s*$"), arguments.get("timeout", 30), start_offset=start)
+            result = payload_result(response, truncated)
+            result["bytes_written"] = written
+            return result
+        if name == "serial_enter_uboot":
+            return self._serial_enter_uboot(arguments)
+        raise ValueError("unknown tool: {0}".format(name))
+
+    def _serial_enter_uboot(self, arguments):
+        reboot_command = arguments.get("reboot_command", "reboot")
+        enter_window = float(arguments.get("enter_window", 60))
+        enter_interval = float(arguments.get("enter_interval", 0.1))
+        prompt_pattern = arguments.get("prompt_pattern", r"(?m).*(#|=>)\s*$")
+        prompt_timeout = float(arguments.get("prompt_timeout", 30))
+        if enter_window <= 0 or enter_interval <= 0:
+            raise ValueError("enter_window and enter_interval must be positive")
+        start = self.session.mark()
+        self.session.write(reboot_command.encode("utf-8") + b"\r")
+        deadline = time.monotonic() + enter_window
+        enters_sent = 0
+        while time.monotonic() < deadline:
+            self.session.write(b"\r")
+            enters_sent += 1
+            remaining = min(enter_interval, max(0.0, deadline - time.monotonic()))
+            try:
+                response, truncated = self.session.wait_for(prompt_pattern, remaining, start_offset=start)
+                result = payload_result(response, truncated)
+                result["enters_sent"] = enters_sent
+                return result
+            except RuntimeError as error:
+                if not str(error).startswith("timed out waiting"):
+                    raise
+        response, truncated = self.session.wait_for(prompt_pattern, prompt_timeout, start_offset=start)
+        result = payload_result(response, truncated)
+        result["enters_sent"] = enters_sent
+        return result
+
+    def handle(self, request):
+        method = request.get("method")
+        request_id = request.get("id")
+        if method == "initialize":
+            return {"jsonrpc": "2.0", "id": request_id, "result": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}, "instructions": "Call serial_open without asking for an endpoint; it defaults to 127.0.0.1:39001. Ask for the endpoint shown in Remote Debug only if the default port is unavailable. serial_command sends the command unchanged and waits for prompt_pattern; use serial_enter_uboot for the bootloader entry sequence."}}
+        if method == "ping":
+            return {"jsonrpc": "2.0", "id": request_id, "result": {}}
+        if method == "tools/list":
+            return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}}
+        if method == "tools/call":
+            parameters = request.get("params") or {}
+            try:
+                result = self.call_tool(parameters.get("name"), parameters.get("arguments") or {})
+                return {"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, sort_keys=True)}]}}
+            except Exception as error:
+                return {"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": str(error)}], "isError": True}}
+        if request_id is None:
+            return None
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found: {0}".format(method)}}
+
+    def run(self):
+        try:
+            for raw_line in sys.stdin:
+                try:
+                    request = json.loads(raw_line)
+                    response = self.handle(request)
+                except Exception as error:
+                    response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error: {0}".format(error)}}
+                if response is not None:
+                    sys.stdout.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
+                    sys.stdout.flush()
+        finally:
+            self.session.close()
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Interactive terminal (default) or MCP server for Remote Debug Serial.")
+    parser.add_argument("endpoint", nargs="?", help="terminal endpoint as HOST:PORT, or HOST when PORT is separate")
+    parser.add_argument("port", nargs="?", help="optional separate terminal TCP port")
+    parser.add_argument("--mcp", action="store_true", help="run as a stdio MCP server")
+    parser.add_argument("--timestamps", action="store_true", help="prefix each received serial line with a local timestamp")
+    parser.add_argument("--connect-timeout", type=float, default=10.0, help="connection timeout in seconds (default: 10)")
+    return parser
+
+
+def run_terminal_main(arguments, parser):
+    try:
+        endpoint = "{0}:{1}".format(*parse_target(arguments.endpoint or os.environ.get("REMOTE_SERIAL_ENDPOINT") or DEFAULT_ENDPOINT, arguments.port))
+    except ValueError as error:
+        parser.error(str(error))
+    input_fd = sys.stdin.fileno()
+    output_fd = sys.stdout.fileno()
+    interactive = os.isatty(input_fd)
+    print("Connecting to {0}...".format(endpoint), file=sys.stderr)
+    try:
+        connection, broker, role = open_shared_connection(endpoint, arguments.connect_timeout)
+    except (OSError, RuntimeError) as error:
+        print("Connection failed: {0}".format(error), file=sys.stderr)
+        return 1
+    print("Connected through local broker ({0}).{1}".format(role, " Press Ctrl+] to exit." if interactive else ""), file=sys.stderr)
+
+    def stop(_signum, _frame):
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
+    try:
+        with TerminalMode(input_fd):
+            return run_terminal(connection, input_fd, output_fd, interactive, arguments.timestamps)
+    except KeyboardInterrupt:
+        return 130
+    except OSError as error:
+        print("\nConnection error: {0}".format(error), file=sys.stderr)
+        return 1
+    finally:
+        try:
+            connection.close()
+        finally:
+            if broker is not None:
+                broker.stop()
+        if interactive:
+            print("\nDisconnected.", file=sys.stderr)
+
+
+def main():
+    parser = build_parser()
+    arguments = parser.parse_args()
+    if arguments.mcp:
+        if arguments.endpoint is not None or arguments.port is not None:
+            parser.error("--mcp does not accept an endpoint; pass HOST:PORT to serial_open")
+        RemoteSerialMcpServer().run()
+        return 0
+    return run_terminal_main(arguments, parser)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

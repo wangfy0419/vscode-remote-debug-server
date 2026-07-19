@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""Dependency-free MCP stdio client for the Container Shell WebSocket API."""
+
+from __future__ import print_function
+
+import base64
+import argparse
+import hashlib
+import json
+import os
+import socket
+import ssl
+import struct
+import sys
+import time
+import uuid
+try:
+    from urllib.parse import urlparse
+except ImportError:  # pragma: no cover
+    from urlparse import urlparse
+
+
+SERVER_NAME = "remote-container-shell-mcp"
+SERVER_VERSION = "1.0.2"
+MCP_PROTOCOL_VERSION = "2024-11-05"
+SHELL_PROTOCOL_VERSION = 1
+OUTPUT_LIMIT = 8 * 1024 * 1024
+DEFAULT_ENDPOINT = "ws://127.0.0.1:44635/container-shell"
+
+
+def parse_endpoint(endpoint):
+    if not endpoint:
+        raise ValueError("endpoint is required; copy it from the Container Shell view")
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in ("ws", "wss"):
+        raise ValueError("endpoint must start with ws:// or wss://")
+    if not parsed.hostname or not parsed.port:
+        raise ValueError("endpoint must include a host and port")
+    if parsed.path not in ("", "/", "/container-shell"):
+        raise ValueError("endpoint path must be /container-shell")
+    path = parsed.path if parsed.path not in ("", "/") else "/container-shell"
+    return parsed.scheme, parsed.hostname, parsed.port, path
+
+
+def recv_exact(connection, size):
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = connection.recv(remaining)
+        if not chunk:
+            raise RuntimeError("Container Shell WebSocket closed unexpectedly")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def read_http_headers(connection):
+    data = bytearray()
+    while b"\r\n\r\n" not in data:
+        chunk = connection.recv(4096)
+        if not chunk:
+            raise RuntimeError("Container Shell WebSocket closed during handshake")
+        data.extend(chunk)
+        if len(data) > 65536:
+            raise RuntimeError("Container Shell WebSocket handshake is too large")
+    headers, remainder = bytes(data).split(b"\r\n\r\n", 1)
+    return headers.decode("iso-8859-1"), remainder
+
+
+def encode_websocket_frame(payload, opcode=1, masked=True):
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    first = 0x80 | opcode
+    length = len(payload)
+    mask_bit = 0x80 if masked else 0
+    if length < 126:
+        header = struct.pack("!BB", first, mask_bit | length)
+    elif length <= 0xffff:
+        header = struct.pack("!BBH", first, mask_bit | 126, length)
+    else:
+        header = struct.pack("!BBQ", first, mask_bit | 127, length)
+    if not masked:
+        return header + payload
+    mask = os.urandom(4)
+    encoded = bytearray(payload)
+    for index in range(len(encoded)):
+        encoded[index] ^= mask[index % 4]
+    return header + mask + bytes(encoded)
+
+
+def read_websocket_frame(connection, initial=b""):
+    buffer = bytearray(initial)
+
+    def take(size):
+        while len(buffer) < size:
+            buffer.extend(recv_exact(connection, size - len(buffer)))
+        result = bytes(buffer[:size])
+        del buffer[:size]
+        return result
+
+    first, second = struct.unpack("!BB", take(2))
+    if not first & 0x80:
+        raise RuntimeError("Fragmented WebSocket messages are not supported")
+    opcode = first & 0x0f
+    masked = bool(second & 0x80)
+    length = second & 0x7f
+    if length == 126:
+        length = struct.unpack("!H", take(2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", take(8))[0]
+    mask = take(4) if masked else None
+    payload = bytearray(take(length))
+    if mask:
+        for index in range(len(payload)):
+            payload[index] ^= mask[index % 4]
+    return opcode, bytes(payload), bytes(buffer)
+
+
+class WebSocketConnection(object):
+    def __init__(self, endpoint, timeout=10.0):
+        scheme, host, port, path = parse_endpoint(endpoint)
+        connection = socket.create_connection((host, port), float(timeout))
+        if scheme == "wss":
+            context = ssl.create_default_context()
+            connection = context.wrap_socket(connection, server_hostname=host)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        host_header = host if (scheme == "ws" and port == 80) or (scheme == "wss" and port == 443) else "{0}:{1}".format(host, port)
+        request = (
+            "GET {0} HTTP/1.1\r\nHost: {1}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: {2}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        ).format(path, host_header, key)
+        connection.sendall(request.encode("ascii"))
+        headers, remainder = read_http_headers(connection)
+        lines = headers.split("\r\n")
+        if not lines or " 101 " not in lines[0]:
+            connection.close()
+            raise RuntimeError("Container Shell WebSocket handshake failed: {0}".format(lines[0] if lines else headers))
+        values = {}
+        for line in lines[1:]:
+            if ":" in line:
+                name, value = line.split(":", 1)
+                values[name.strip().lower()] = value.strip()
+        expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()).decode("ascii")
+        if values.get("sec-websocket-accept") != expected:
+            connection.close()
+            raise RuntimeError("Container Shell WebSocket returned an invalid accept key")
+        self.connection = connection
+        self.remainder = remainder
+
+    def send_json(self, value):
+        self.connection.sendall(encode_websocket_frame(json.dumps(value, separators=(",", ":"))))
+
+    def receive_json(self):
+        while True:
+            opcode, payload, self.remainder = read_websocket_frame(self.connection, self.remainder)
+            if opcode == 1:
+                return json.loads(payload.decode("utf-8"))
+            if opcode == 8:
+                raise RuntimeError("Container Shell WebSocket closed")
+            if opcode == 9:
+                self.connection.sendall(encode_websocket_frame(payload, opcode=10))
+
+    def close(self):
+        try:
+            self.connection.sendall(encode_websocket_frame(b"", opcode=8))
+        except OSError:
+            pass
+        try:
+            self.connection.close()
+        except OSError:
+            pass
+
+
+def append_limited(target, data):
+    remaining = OUTPUT_LIMIT - len(target)
+    if remaining > 0:
+        target.extend(data[:remaining])
+    return len(data) > remaining
+
+
+def execute_container_shell(endpoint, command):
+    if not isinstance(command, str) or not command:
+        raise ValueError("command is required")
+    websocket = WebSocketConnection(endpoint)
+    request_id = uuid.uuid4().hex
+    stdout = bytearray()
+    stderr = bytearray()
+    stdout_truncated = False
+    stderr_truncated = False
+    timeout_error = None
+    try:
+        ready = websocket.receive_json()
+        if ready.get("type") != "ready" or ready.get("version") != SHELL_PROTOCOL_VERSION:
+            raise RuntimeError("Unsupported Container Shell protocol response")
+        websocket.send_json({
+            "type": "exec",
+            "id": request_id,
+            "command": command,
+            "timeoutMs": 0,
+        })
+        while True:
+            message = websocket.receive_json()
+            if message.get("id") != request_id:
+                continue
+            message_type = message.get("type")
+            if message_type in ("stdout", "stderr"):
+                try:
+                    data = base64.b64decode(message.get("data", ""), validate=True)
+                except Exception:
+                    raise RuntimeError("Container Shell returned invalid Base64 output")
+                if message_type == "stdout":
+                    stdout_truncated = append_limited(stdout, data) or stdout_truncated
+                else:
+                    stderr_truncated = append_limited(stderr, data) or stderr_truncated
+            elif message_type == "error":
+                if message.get("code") == "COMMAND_TIMEOUT":
+                    timeout_error = message.get("message")
+                else:
+                    raise RuntimeError(message.get("message") or "Container Shell command failed")
+            elif message_type == "exit":
+                return {
+                    "stdout": bytes(stdout).decode("utf-8", "replace"),
+                    "stderr": bytes(stderr).decode("utf-8", "replace"),
+                    "stdout_truncated": stdout_truncated,
+                    "stderr_truncated": stderr_truncated,
+                    "exit_code": message.get("exitCode"),
+                    "signal": message.get("signal"),
+                    "duration_ms": message.get("durationMs"),
+                    "timed_out": timeout_error is not None,
+                }
+    finally:
+        websocket.close()
+
+
+TOOLS = [{
+    "name": "container_shell",
+    "description": "Execute one arbitrary non-interactive shell command inside the VS Code remote container. By default it uses ws://127.0.0.1:44635/container-shell; endpoint is optional and only needed to override the configured default.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "endpoint": {"type": "string", "description": "Optional WebSocket endpoint override"},
+            "command": {"type": "string", "description": "Arbitrary shell command executed as /bin/bash -lc"},
+        },
+        "required": ["command"],
+        "additionalProperties": False,
+    },
+}]
+
+
+class ContainerShellMcpServer(object):
+    def __init__(self, default_endpoint=None):
+        self.default_endpoint = default_endpoint or os.environ.get("CONTAINER_SHELL_ENDPOINT") or DEFAULT_ENDPOINT
+
+    def call_tool(self, name, arguments):
+        if name != "container_shell":
+            raise ValueError("unknown tool: {0}".format(name))
+        arguments = arguments or {}
+        endpoint = arguments.get("endpoint") or self.default_endpoint
+        return execute_container_shell(endpoint, arguments.get("command"))
+
+    def handle(self, request):
+        method = request.get("method")
+        request_id = request.get("id")
+        if method == "initialize":
+            return {"jsonrpc": "2.0", "id": request_id, "result": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                "instructions": "Use container_shell without asking for endpoint; it defaults to ws://127.0.0.1:44635/container-shell. Pass endpoint only when the user explicitly uses another configured port or VS Code window.",
+            }}
+        if method == "ping":
+            return {"jsonrpc": "2.0", "id": request_id, "result": {}}
+        if method == "tools/list":
+            return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}}
+        if method == "tools/call":
+            parameters = request.get("params") or {}
+            try:
+                result = self.call_tool(parameters.get("name"), parameters.get("arguments") or {})
+                return {"jsonrpc": "2.0", "id": request_id, "result": {
+                    "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, sort_keys=True)}],
+                }}
+            except Exception as error:
+                return {"jsonrpc": "2.0", "id": request_id, "result": {
+                    "content": [{"type": "text", "text": str(error)}], "isError": True,
+                }}
+        if request_id is None:
+            return None
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found: {0}".format(method)}}
+
+    def run(self):
+        for raw_line in sys.stdin:
+            try:
+                response = self.handle(json.loads(raw_line))
+            except Exception as error:
+                response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error: {0}".format(error)}}
+            if response is not None:
+                sys.stdout.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
+                sys.stdout.flush()
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="MCP stdio server for the Container Shell WebSocket API")
+    parser.add_argument(
+        "--endpoint",
+        default=os.environ.get("CONTAINER_SHELL_ENDPOINT", DEFAULT_ENDPOINT),
+        help="Default Container Shell WebSocket endpoint",
+    )
+    return parser
+
+
+if __name__ == "__main__":
+    arguments = build_parser().parse_args()
+    ContainerShellMcpServer(arguments.endpoint).run()
