@@ -156,12 +156,9 @@ class AdbSession {
 		if (this.ws.readyState !== WebSocket.OPEN) {return Promise.reject(new Error("Local ADB bridge is closed"));}
 		const id = this.nextFrameId++ >>> 0;
 		return new Promise<void>((resolve, reject) => {
-			this.pendingAcks.set(id, { resolve, reject });
 			this.ws.send(encodeBridgeFrame(BRIDGE_FRAME_DATA, id, this.withConnectionId(connectionId, data)), (error) => {
-				if (error) {
-					this.pendingAcks.delete(id);
-					reject(error);
-				}
+				if (error) {reject(error);}
+				else {resolve();}
 			});
 		});
 	}

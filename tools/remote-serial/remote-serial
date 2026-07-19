@@ -396,13 +396,61 @@ def write_timestamped(output_fd, data, state):
             state["line_start"] = True
 
 
-def run_terminal(connection, input_fd, output_fd, escape_enabled, timestamps=False):
+def write_normalized_timestamped(output_fd, data, state):
+    if not data:
+        return
+    text = data.decode("utf-8", "replace")
+    for character in text:
+        if state.get("pending_cr"):
+            if character == "\n":
+                write_log_character(output_fd, "\n", state)
+                state["pending_cr"] = False
+                continue
+            write_log_character(output_fd, "\n", state)
+            state["pending_cr"] = False
+        if character == "\r":
+            state["pending_cr"] = True
+            continue
+        write_log_character(output_fd, character, state)
+
+
+def write_log_character(output_fd, character, state):
+    if state["line_start"]:
+        write_all(output_fd, timestamp_prefix().encode("utf-8"))
+        state["line_start"] = False
+    write_all(output_fd, character.encode("utf-8", "replace"))
+    if character == "\n":
+        state["line_start"] = True
+
+
+def flush_normalized_log(output_fd, state):
+    if state.get("pending_cr"):
+        write_log_character(output_fd, "\n", state)
+        state["pending_cr"] = False
+
+
+def write_received(output_fd, data, timestamps, state):
+    if timestamps:
+        write_timestamped(output_fd, data, state)
+    else:
+        write_all(output_fd, data)
+
+
+def write_log_received(output_fd, data, timestamps, state):
+    if timestamps:
+        write_normalized_timestamped(output_fd, data, state)
+    else:
+        write_all(output_fd, data.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
+
+
+def run_terminal(connection, input_fd, output_fd, escape_enabled, timestamps=False, log_fd=None):
     selector = selectors.DefaultSelector()
     selector.register(connection, selectors.EVENT_READ, "socket")
     selector.register(input_fd, selectors.EVENT_READ, "stdin")
     stdin_open = True
     idle_deadline = None
     timestamp_state = {"line_start": True}
+    log_timestamp_state = {"line_start": True, "pending_cr": False}
     try:
         while True:
             timeout = None if idle_deadline is None else max(0.0, idle_deadline - time.monotonic())
@@ -414,10 +462,9 @@ def run_terminal(connection, input_fd, output_fd, escape_enabled, timestamps=Fal
                     data = connection.recv(BUFFER_SIZE)
                     if not data:
                         return 0
-                    if timestamps:
-                        write_timestamped(output_fd, data, timestamp_state)
-                    else:
-                        write_all(output_fd, data)
+                    write_received(output_fd, data, timestamps, timestamp_state)
+                    if log_fd is not None:
+                        write_log_received(log_fd, data, timestamps, log_timestamp_state)
                     if idle_deadline is not None:
                         idle_deadline = time.monotonic() + PIPE_IDLE_TIMEOUT
                     continue
@@ -437,6 +484,8 @@ def run_terminal(connection, input_fd, output_fd, escape_enabled, timestamps=Fal
             if not stdin_open and idle_deadline is None:
                 idle_deadline = time.monotonic() + PIPE_IDLE_TIMEOUT
     finally:
+        if log_fd is not None and timestamps:
+            flush_normalized_log(log_fd, log_timestamp_state)
         selector.close()
 
 
@@ -787,6 +836,7 @@ def build_parser():
     parser.add_argument("port", nargs="?", help="optional separate terminal TCP port")
     parser.add_argument("--mcp", action="store_true", help="run as a stdio MCP server")
     parser.add_argument("--timestamps", action="store_true", help="prefix each received serial line with a local timestamp")
+    parser.add_argument("--log-file", help="append received serial output to this file")
     parser.add_argument("--connect-timeout", type=float, default=10.0, help="connection timeout in seconds (default: 10)")
     return parser
 
@@ -799,10 +849,22 @@ def run_terminal_main(arguments, parser):
     input_fd = sys.stdin.fileno()
     output_fd = sys.stdout.fileno()
     interactive = os.isatty(input_fd)
+    log_file = os.path.abspath(arguments.log_file) if arguments.log_file else None
+    log_handle = None
+    if log_file:
+        log_directory = os.path.dirname(log_file)
+        if log_directory:
+            os.makedirs(log_directory, 0o755, exist_ok=True)
+        log_handle = open(log_file, "ab", buffering=0)
+        print("Serial log file: {0}".format(log_file), file=sys.stderr)
+        print("Serial log directory: {0}".format(os.path.dirname(log_file)), file=sys.stderr)
+        print("Serial log filename: {0}".format(os.path.basename(log_file)), file=sys.stderr)
     print("Connecting to {0}...".format(endpoint), file=sys.stderr)
     try:
         connection, broker, role = open_shared_connection(endpoint, arguments.connect_timeout)
     except (OSError, RuntimeError) as error:
+        if log_handle is not None:
+            log_handle.close()
         print("Connection failed: {0}".format(error), file=sys.stderr)
         return 1
     print("Connected through local broker ({0}).{1}".format(role, " Press Ctrl+] to exit." if interactive else ""), file=sys.stderr)
@@ -817,7 +879,7 @@ def run_terminal_main(arguments, parser):
     signal.signal(signal.SIGHUP, stop)
     try:
         with TerminalMode(input_fd):
-            return run_terminal(connection, input_fd, output_fd, interactive, arguments.timestamps)
+            return run_terminal(connection, input_fd, output_fd, interactive, arguments.timestamps, log_handle.fileno() if log_handle is not None else None)
     except KeyboardInterrupt:
         return 130
     except OSError as error:
@@ -829,6 +891,8 @@ def run_terminal_main(arguments, parser):
         finally:
             if broker is not None:
                 broker.stop()
+            if log_handle is not None:
+                log_handle.close()
         if interactive:
             print("\nDisconnected.", file=sys.stderr)
 

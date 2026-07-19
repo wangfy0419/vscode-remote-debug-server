@@ -55,6 +55,14 @@ async function installRemoteSerialScript(context: vscode.ExtensionContext): Prom
 function quotePosixShellArgument(value: string): string {
 	return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
+
+function serialLogFilePath(endpoint: string, label?: string, portIdentifier?: string): string {
+	const rawKey = (portIdentifier || label || endpoint).trim();
+	const normalizedKey = /^COM\d+$/i.test(rawKey) ? rawKey.toUpperCase() : rawKey;
+	const safeName = normalizedKey.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "serial";
+	return path.join(os.homedir(), "serial-logs", `${safeName}.log`);
+}
+
 function adbCommandPrefix(adbServerSocket?: string): string {
 	return adbServerSocket ? `ADB_SERVER_SOCKET=${quotePosixShellArgument(adbServerSocket)} ` : "";
 }
@@ -322,18 +330,21 @@ export function activate(context: vscode.ExtensionContext) {
 		return true;
 	}));
 
-	context.subscriptions.push(vscode.commands.registerCommand('remote-debug-server.openSerialLogTerminal', async (endpoint: string, label?: string) => {
+	context.subscriptions.push(vscode.commands.registerCommand('remote-debug-server.openSerialLogTerminal', async (endpoint: string, label?: string, portIdentifier?: string) => {
 		if (typeof endpoint !== "string" || !endpoint.trim()) {
 			throw new Error("A Serial TCP endpoint is required");
 		}
+		const logFile = serialLogFilePath(endpoint, label, portIdentifier);
+		await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(logFile)));
 		const terminal = vscode.window.createTerminal({
 			name: `Serial Log: ${label || endpoint}`,
 			shellPath: await remoteSerialScriptPath(context),
-			shellArgs: ["--timestamps", endpoint],
+			shellArgs: ["--timestamps", "--log-file", logFile, endpoint],
 			location: vscode.TerminalLocation.Editor,
 		});
 		terminal.show();
-		return true;
+		vscode.window.showInformationMessage(`Serial log file: ${logFile}`);
+		return logFile;
 	}));
 
 	context.subscriptions.push(vscode.commands.registerCommand('remote-debug-server.listAdbBridgeDevices', async (endpoint: string): Promise<AdbDeviceInfo[]> => {
