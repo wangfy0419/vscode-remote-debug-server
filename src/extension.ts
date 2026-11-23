@@ -37,19 +37,24 @@ async function remoteSerialScriptPath(context: vscode.ExtensionContext): Promise
 
 async function installRemoteSerialScript(context: vscode.ExtensionContext): Promise<string> {
 	const source = vscode.Uri.joinPath(context.extensionUri, "tools", "remote-serial", "remote-serial");
+	const packaged = source.fsPath;
 	const targetDirectory = vscode.Uri.file(`${os.homedir()}/tools`);
 	const target = vscode.Uri.joinPath(targetDirectory, "remote-serial");
-	await vscode.workspace.fs.createDirectory(targetDirectory);
-	await vscode.workspace.fs.writeFile(target, await vscode.workspace.fs.readFile(source));
 	try {
-		await vscode.workspace.fs.stat(target);
-		await new Promise<void>((resolve, reject) => {
-			require("fs").chmod(target.fsPath, 0o755, (error: Error | null) => error ? reject(error) : resolve());
-		});
+		await vscode.workspace.fs.createDirectory(targetDirectory);
+		await vscode.workspace.fs.writeFile(target, await vscode.workspace.fs.readFile(source));
+		await fs.promises.chmod(target.fsPath, 0o755);
+		return target.fsPath;
 	} catch (error) {
-		logger.warn(`Failed to chmod remote-serial tool: ${(error as Error).message}`);
+		// A read-only or missing home directory must not block opening a Serial terminal.
+		logger.warn(`Falling back to the bundled remote-serial tool (${packaged}): ${(error as Error).message}`);
+		try {
+			await fs.promises.chmod(packaged, 0o755);
+		} catch (chmodError) {
+			logger.warn(`Failed to chmod bundled remote-serial tool: ${(chmodError as Error).message}`);
+		}
+		return packaged;
 	}
-	return target.fsPath;
 }
 
 function quotePosixShellArgument(value: string): string {
@@ -320,9 +325,11 @@ export function activate(context: vscode.ExtensionContext) {
 		if (typeof endpoint !== "string" || !endpoint.trim()) {
 			throw new Error("A Serial TCP endpoint is required");
 		}
+		const scriptPath = await remoteSerialScriptPath(context);
+		logger.info(`Opening Serial terminal for ${label || endpoint} at ${endpoint} using ${scriptPath}`);
 		const terminal = vscode.window.createTerminal({
 			name: `Serial: ${label || endpoint}`,
-			shellPath: await remoteSerialScriptPath(context),
+			shellPath: scriptPath,
 			shellArgs: [endpoint],
 			location: vscode.TerminalLocation.Editor,
 		});

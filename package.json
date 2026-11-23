@@ -4,7 +4,7 @@
 	"displayName": "Remote Debug (Server)",
 	"description": "Provide remote-side ADB, Fastboot, serial, and container shell bridge services for Remote Debug",
 	"repository": "https://code.xgimi.com/ai-productivity/vscode-remote-adb-server",
-	"version": "1.0.14",
+		"version": "1.0.18",
 	"engines": {
 		"vscode": "^1.74.0"
 	},

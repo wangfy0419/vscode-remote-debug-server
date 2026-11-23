@@ -1,5 +1,11 @@
 # Change Log
 
+## 1.0.18
+
+- Align the server extension version with the client extension `xhosa.remote-debug`.
+- Fall back to the extension-bundled `remote-serial` tool when `~/tools` cannot be created or written.
+- Log the resolved `remote-serial` script and endpoint when opening a Serial terminal.
+
 ## 1.0.3
 
 - Fix extension activation by bundling the JSONC parser implementation used for Copilot MCP configuration updates.
